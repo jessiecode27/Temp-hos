@@ -1,18 +1,4 @@
 ###############################################################################
-# Updated version of the code for the analysis in:
-#
-#   "Reducing and meta-analyzing estimates from distributed lag non-linear models"
-#   Gasparrini and Armstrong 
-#   BMC Medical Research Methodology - 2013
-#   http://www.ag-myresearch.com/2013_gasparrini_bmcmrm.html
-#
-# Update: 05 December 2017
-# * an updated version of this code, compatible with future versions of the
-#   software, is available at:
-#   http://www.ag-myresearch.com/2013_gasparrini_bmcmrm.html
-###############################################################################
-
-###############################################################################
 # CREATE 3 OBJECTS:
 #
 # 1) A VECTOR WITH NAMES OF REGIONS OF ENGLAND AND WALES
@@ -28,7 +14,7 @@
 #
 ###############################################################################
 
-# LOAD PACKAGES (ASSUMED ALREADY INSTALLED)
+# LOAD PACKAGES 
 library(dlnm) ; library(mvmeta) ; library(splines)
 
 # CHECK VERSION OF THE PACKAGE
@@ -73,22 +59,9 @@ fqaic <- function(model) {
 
 sum(data$hos2)
 #
-###############################################################################
-# Updated version of the code for the analysis in:
-#
-#   "Reducing and meta-analyzing estimates from distributed lag non-linear models"
-#   Gasparrini and Armstrong 
-#   BMC Medical Research Methodology - 2013
-#   http://www.ag-myresearch.com/2013_gasparrini_bmcmrm.html
-#
-# Update: 05 December 2017
-# * an updated version of this code, compatible with future versions of the
-#   software, is available at:
-#   http://www.ag-myresearch.com/2013_gasparrini_bmcmrm.html
-###############################################################################
 
 ####################################################################
-# RUN AN EXAMPLE OF FIRST-STAGE ANALYSIS FOR A SINGLE REGION
+# RUN FIRST-STAGE ANALYSIS FOR A SINGLE REGION
 ####################################################################
 # 1. Dien Bien
 # SELECT REGION
@@ -173,7 +146,7 @@ sd(data[[reg]]$icd_L)
 
 ```
 
-Figure 1. Histograms, scatter plots and Correlation coefficients  betweens weather conditions and hospitalization
+Figure 1. Histograms, scatter plots and Correlation coefficients  between weather conditions and hospitalization
 ```{r}
 require("psych")
 #pairs.panels(data[[reg]][,c("hos","tmean","tmin","tmax","rh", "rain")])
@@ -188,7 +161,7 @@ Figure 2. Time series plots of weather variables and all-cause hospitalization
 oldpar <- par(no.readonly=TRUE)
 par(mex=0.8,mfrow=c(3,1))
 
-# SUB-PLOT FOR all, WITH VERTICAL LINES DEFINING YEARS
+# SUB-PLOT FOR ALL, WITH VERTICAL LINES DEFINING YEARS
 plot(data[[reg]]$hos2~as.Date(data[[reg]]$date),type="l",main="Number of hospital admissions for all causes 2005-2015",
      ylab="Cases",xlab="Date")
 abline(v=as.Date(data[[reg]]$date[grep("-01-01",data[[reg]]$date)]),col=grey(0.6),lty=2)
@@ -431,7 +404,7 @@ mtext(text="Overall cumulative association",cex=0.7)
 dev.off()
 
 #
-# Hospitalizarion Coefs and SD (1oC above MMT==28)
+# Hospitalization Coefs and SD (1oC above MMT==28)
 ```{r}
 hospital_db<-matrix(NA,nrow=36,ncol=3)
 colnames(hospital_db)<-c("RR","RRlow","RRhigh")
@@ -1061,7 +1034,7 @@ mtext(text="Overall cumulative association",cex=0.7)
 dev.off()
 
 #
-# Hospitalizarion Coefs and SD (1oC above MMT==19)
+# Hospitalization Coefs and SD (1oC above MMT==19)
 ```{r}
 hospital_tq<-matrix(NA,nrow=36,ncol=3)
 colnames(hospital_tq)<-c("RR","RRlow","RRhigh")
@@ -2557,7 +2530,6 @@ write.csv(hospital_vl,"hospitalvl coefs.csv")
 
 ```
 
-
 ####################################################################
 # 5.
 # SELECT REGION
@@ -2628,7 +2600,7 @@ sd(data[[reg]]$icd_L)
 
 ```
 
-Figure 1. Histograms, scatter plots and Correlation coefficients  betweens weather conditions and hospitalization
+Figure 1. Histograms, scatter plots and Correlation coefficients  between weather conditions and hospitalization
 ```{r}
 require("psych")
 #pairs.panels(data[[reg]][,c("hos","tmean","tmin","tmax","rh", "rain")])
@@ -2643,7 +2615,7 @@ Figure 2. Time series plots of weather variables and all-cause hospitalization
 oldpar <- par(no.readonly=TRUE)
 par(mex=0.8,mfrow=c(3,1))
 
-# SUB-PLOT FOR all, WITH VERTICAL LINES DEFINING YEARS
+# SUB-PLOT FOR ALL, WITH VERTICAL LINES DEFINING YEARS
 plot(data[[reg]]$hos2~as.Date(data[[reg]]$date),type="l",main="Number of hospital admissions for all causes 2011-2014",
      ylab="Cases",xlab="Date")
 abline(v=as.Date(data[[reg]]$date[grep("-01-01",data[[reg]]$date)]),col=grey(0.6),lty=2)
@@ -2904,7 +2876,7 @@ mtext(text="Overall cumulative association",cex=0.7)
 
 dev.off()
 
-# Hospitalizarion Coefs and SD (1oC above MMT==25)
+# Hospitalization Coefs and SD (1oC above MMT==25)
 ```{r}
 hospital_ag<-matrix(NA,nrow=36,ncol=3)
 colnames(hospital_ag)<-c("RR","RRlow","RRhigh")
@@ -3514,10 +3486,9 @@ plot(crall,xlab="Temperature (C)",ylab="RR",ylim=c(.8,2),col=2,lwd=2)
 mtext(text="Overall cumulative association",cex=0.7)
 
 dev.off()
-
-
-#
-# Hospitalizarion Coefs and SD (1oC above MMT==25)
+###
+                   
+# Hospitalization Coefs and SD (1oC above MMT==25)
 ```{r}
 hospital_bp<-matrix(NA,nrow=36,ncol=3)
 colnames(hospital_bp)<-c("RR","RRlow","RRhigh")
