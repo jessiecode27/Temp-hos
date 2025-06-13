@@ -1,0 +1,4667 @@
+---
+title: "all2_hw1"
+author: "Vyy"
+date: "2023-01-20"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#read the datafile, packages
+```{r}
+# LOAD PACKAGES (ASSUMED ALREADY INSTALLED)
+library(dlnm) ; library(mvmeta) ; library(splines)
+
+# CHECK VERSION OF THE PACKAGE
+if(packageVersion("dlnm")<"2.2.0")
+  stop("update dlnm package to version >= 2.2.0")
+
+# LOAD THE DATASET
+
+library(readxl)
+All2 <- read_excel("Documents/OneDrive - UMP/Projects/farmer/data/data2mien/All2.xlsx")
+#View(All2)
+data<-All2
+dim(data)
+head(data)
+
+data$dow<-weekdays(data$date)
+data$time <- seq(nrow(data))
+
+# REGIONS
+regions <- as.character(unique(data$regnames))
+
+# CREATE A LIST WITH THE REGIONAL SERIES
+data <- lapply(regions,function(x) data[data$regnames==x,])
+names(data) <- regions
+m <- length(regions)
+
+# TEMPERATURE RANGES
+ranges <- t(sapply(data, function(x) range(x$tmean,na.rm=T)))
+
+####################################################################
+
+# FUNCTION TO COMPUTE THE Q-AIC IN QUASI-POISSON MODELS
+fqaic <- function(model) {
+  loglik <- sum(dpois(model$y,model$fitted.values,log=TRUE))
+  phi <- summary(model)$dispersion
+  qaic <- -2*loglik + 2*summary(model)$df[3]*phi
+  return(qaic)
+}
+```
+#1. DIEN BIEN
+
+## Heatwave analysis
+load packages, functions and create matrix for storing results
+```{r}
+reg <- "DB"
+nrow(data[[reg]])
+
+# GLM WITH KNOTS SPECIFIED A PRIORI (GASPARRINI BMCmrm 2014)
+library(dlnm) ; library(mgcv) ; library(splines) ; library(tsModel)
+data[[reg]]$Temp<-data[[reg]]$tmean
+# DEFINE THE CROSS-BASIS
+bound <- colMeans(ranges)
+varknots <- equalknots(data[[reg]]$tmean,fun="bs",degree=2,df=3)
+lagknots <- logknots(21,df=5,int=T)
+argvar <- list(fun="bs",degree=2,knots=varknots)
+arglag <- list(fun="ns",knots=lagknots)
+
+# BASIS FOR TEMPERATURE:
+# - QUADRATIC SPLINE FOR PREDICTOR, WITH SPECIFIC KNOT SELECTION
+# - NATURAL CUBIC SPLINE FOR LAG, WITH DF AT EQUALLY-SPACED LOG-VALUES
+# WARNING FOR PREDICTION BEYOND BOUNDARIES SUPPRESSED
+suppressWarnings(
+  cb <- crossbasis(data[[reg]]$tmean,lag=21,argvar=argvar,arglag=arglag)
+)
+summary(cb)
+
+# RUN THE MODEL
+model <- glm(hos2 ~ cb + dow + ns(time,df=11*4)+ ns(rh,df=3),
+             family=quasipoisson(),data[[reg]])
+
+
+range<-quantile(data[[reg]]$tmean,c(0.50,0.95),na.rm=TRUE)
+predglm1 <- crosspred(cb,model,at=seq(range[1],range[2],0.1))
+ot<-which.min(predglm1$allRRfit)
+ot
+
+cbglm1 <- crossbasis(data[[reg]]$tmean, lag=21, argvar=list(fun="bs",degree=2,
+                                                            knots=varknots,cen=28), arglag=arglag)
+glm1 <- glm(hos2~cbglm1+ns(time,11*4)+dow+ ns(rh,df=3),family=quasipoisson(),data[[reg]])
+predglm1 <- crosspred(cbglm1,cumul=T,glm1,by=0.1, cen=28)
+
+# ESTIMATED EFFECTS AT EACH LAG
+pred1 <- crosspred(cbglm1,glm1, at=29)
+tablag1 <- with(pred1,t(rbind(matRRfit,matRRlow,matRRhigh)))
+tablag1
+
+#RR cua tung nhiet do (commulative lags)
+pred1$allRRfit
+pred1$allRRhigh
+pred1$allRRlow
+
+
+bd<-data[[reg]]
+# LOAD PACKAGES AND FUNCTIONS
+library(dlnm) ; library(splines) ; library(mgcv);require(MASS);require(lmtest)
+require(Epi);require(tsModel)
+require(metafor);require(foreign)
+library("metaforest")
+# FUNCTION TO CREATE AN HEAT WAVE INDICATOR FOR A TEMPERATURE SERIES
+# 	BASED ON THE THRESHOLD AND THE DURATION, BY GROUPS
+fun.hw.thr <- function(x,thr,dur,group=NULL) {
+  as.numeric(apply(Lag(x>=thr,0:(dur-1),group=group),
+                   1,sum,na.rm=T)>(dur-1))
+}
+
+# CREATE THE MATRICES TO STORE THE RESULTS
+#   DESCRIPTIVE STATS
+hw.N <- matrix(NA,6,1, dimnames=list(paste("hw",rep(c(2,4),each=3),rep(c(97,98,99),2),sep=".")))
+hw.cons <- matrix(NA,6,4, dimnames= list(paste("consecutive days",rep(c(2,4),each=3),rep(c(97,98,99),2),sep="."),
+                                         paste(c("N","Max",">3",">7"))))
+```
+
+**First analysis: Indicator for different hw definitions**
+```{r}
+#############################################################
+# FIRST ANALYSIS: INDICATOR FOR DIFFERENT hw DEFINITIONS
+#############################################################
+
+percentiles<-round(quantile(bd$tmean,c(1,3,5,97,98,99)/100,na.rm=T),1)
+range <- round(range(bd$tmean,na.rm=T),1)
+
+# hw DEFINITIONS
+hw.def <- cbind(rep(percentiles[4:6],2),rep(c(2,4),c(3,3)))
+
+main.eff<-added.eff<-matrix(NA,nrow=length(hw.def),1, 
+                            dimnames=list(paste("hw",rep(c(2,4),each=6),rep(c(97,98,99),
+                                                                            each=2),c("est","sd"),sep=".")))
+
+hw.indicator<-matrix(NA,nrow=4017,6)
+colnames(hw.indicator)<-c("hw97.2","hw98.2","hw99.2","hw97.4","hw98.4","hw99.4")
+
+bd$year<-as.factor(format(bd$date, "%Y"))
+
+#Create hw indicator for each hw definition
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.indicator[,k]<-hw
+  hw.N[k] <- sum(hw)
+}
+
+db<-data.frame(bd[,c("tmean","tmin","tmax","date")],hw.indicator)
+write.csv(db,"/Users/guest2/Desktop/db.csv")
+
+# RUN THE MODEL FOR EACH DEFINITION
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(hos2 ~ hw +  cbglm1+ns(time,11*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=28)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+db_hos2<-data.frame(main.eff,added.eff)
+```
+
+# icd_AB
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_AB ~ hw +  cbglm1+ns(time,11*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=28)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+db_icdAB<-data.frame(main.eff,added.eff)
+```
+
+# icd_D
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_D ~ hw +  cbglm1+ns(time,11*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=28)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(eest+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+db_icdD<-data.frame(main.eff,added.eff)
+```
+# icd_E
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_E ~ hw +  cbglm1+ns(time,11*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=28)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+db_icdE<-data.frame(main.eff,added.eff)
+```
+# icd_F
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_F ~ hw +  cbglm1+ns(time,11*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=28)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+db_icdF<-data.frame(main.eff,added.eff)
+```
+# icd_I
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_I ~ hw +  cbglm1+ns(time,11*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=28)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+db_icdI<-data.frame(main.eff,added.eff)
+```
+# icd_J
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_J ~ hw +  cbglm1+ns(time,11*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=28)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+db_icdJ<-data.frame(main.eff,added.eff)
+```
+# icd_K
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_K ~ hw +  cbglm1+ns(time,11*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=28)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+db_icdK<-data.frame(main.eff,added.eff)
+```
+# icd_L
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_L ~ hw +  cbglm1+ns(time,11*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=28)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+db_icdL<-data.frame(main.eff,added.eff)
+```
+
+# icd_N
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_N ~ hw +  cbglm1+ns(time,11*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=28)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+db_icdN<-data.frame(main.eff,added.eff)
+```
+# icd_O
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_O ~ hw +  cbglm1+ns(time,11*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=28)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+db_icdO<-data.frame(main.eff,added.eff)
+```
+
+# icd_P
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_P ~ hw +  cbglm1+ns(time,11*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=28)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+db_icdP<-data.frame(main.eff,added.eff)
+```
+
+# d_0050
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_0050 ~ hw +  cbglm1+ns(time,11*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=28)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+db_d0050<-data.frame(main.eff,added.eff)
+```
+
+# d_51
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_51 ~ hw +  cbglm1+ns(time,11*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=28)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+db_d51<-data.frame(main.eff,added.eff)
+```
+# d_0060
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_0060 ~ hw +  cbglm1+ns(time,11*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=28)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+db_d0060<-data.frame(main.eff,added.eff)
+```
+
+# d_61
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_61 ~ hw +  cbglm1+ns(time,11*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=28)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+db_d61<-data.frame(main.eff,added.eff)
+```
+#2. TUYEN QUANG
+
+## Heatwave analysis
+load packages, functions and create matrix for storing results
+```{r}
+reg <- "TQ"
+nrow(data[[reg]])
+
+# GLM WITH KNOTS SPECIFIED A PRIORI (GASPARRINI BMCmrm 2014)
+library(dlnm) ; library(mgcv) ; library(splines) ; library(tsModel)
+data[[reg]]$Temp<-data[[reg]]$tmean
+# DEFINE THE CROSS-BASIS
+bound <- colMeans(ranges)
+varknots <- equalknots(data[[reg]]$tmean,fun="bs",degree=2,df=3)
+lagknots <- logknots(21,df=5,int=T)
+argvar <- list(fun="bs",degree=2,knots=varknots)
+arglag <- list(fun="ns",knots=lagknots)
+
+# BASIS FOR TEMPERATURE:
+# - QUADRATIC SPLINE FOR PREDICTOR, WITH SPECIFIC KNOT SELECTION
+# - NATURAL CUBIC SPLINE FOR LAG, WITH DF AT EQUALLY-SPACED LOG-VALUES
+# WARNING FOR PREDICTION BEYOND BOUNDARIES SUPPRESSED
+suppressWarnings(
+  cb <- crossbasis(data[[reg]]$tmean,lag=21,argvar=argvar,arglag=arglag)
+)
+summary(cb)
+
+# RUN THE MODEL
+model <- glm(hos2 ~ cb + dow + ns(time,df=6*4)+ ns(rh,df=3),
+             family=quasipoisson(),data[[reg]])
+
+
+range<-quantile(data[[reg]]$tmean,c(0.05,0.95),na.rm=TRUE)
+predglm1 <- crosspred(cb,model,at=seq(range[1],range[2],0.1))
+ot<-which.min(predglm1$allRRfit)
+ot
+
+cbglm1 <- crossbasis(data[[reg]]$tmean, lag=21, argvar=list(fun="bs",degree=2,
+                                                            knots=varknots,cen=19), arglag=arglag)
+glm1 <- glm(hos2~cbglm1+ns(time,6*4)+dow+ ns(rh,df=3),family=quasipoisson(),data[[reg]])
+predglm1 <- crosspred(cbglm1,cumul=T,glm1,by=0.1, cen=19)
+
+# ESTIMATED EFFECTS AT EACH LAG
+pred1 <- crosspred(cbglm1,glm1, at=20)
+tablag1 <- with(pred1,t(rbind(matRRfit,matRRlow,matRRhigh)))
+tablag1
+
+#RR cua tung nhiet do (commulative lags)
+pred1$allRRfit
+pred1$allRRhigh
+pred1$allRRlow
+
+
+bd<-data[[reg]]
+# LOAD PACKAGES AND FUNCTIONS
+library(dlnm) ; library(splines) ; library(mgcv);require(MASS);require(lmtest)
+require(Epi);require(tsModel)
+require(metafor);require(foreign)
+library("metaforest")
+# FUNCTION TO CREATE AN HEAT WAVE INDICATOR FOR A TEMPERATURE SERIES
+# 	BASED ON THE THRESHOLD AND THE DURATION, BY GROUPS
+fun.hw.thr <- function(x,thr,dur,group=NULL) {
+  as.numeric(apply(Lag(x>=thr,0:(dur-1),group=group),
+                   1,sum,na.rm=T)>(dur-1))
+}
+
+# CREATE THE MATRICES TO STORE THE RESULTS
+#   DESCRIPTIVE STATS
+hw.N <- matrix(NA,6,1, dimnames=list(paste("hw",rep(c(2,4),each=3),rep(c(97,98,99),2),sep=".")))
+hw.cons <- matrix(NA,6,4, dimnames= list(paste("consecutive days",rep(c(2,4),each=3),rep(c(97,98,99),2),sep="."),
+                                         paste(c("N","Max",">3",">7"))))
+```
+
+**First analysis: Indicator for different hw definitions**
+```{r}
+#############################################################
+# FIRST ANALYSIS: INDICATOR FOR DIFFERENT hw DEFINITIONS
+#############################################################
+
+percentiles<-round(quantile(bd$tmean,c(1,3,5,97,98,99)/100,na.rm=T),1)
+range <- round(range(bd$tmean,na.rm=T),1)
+
+# hw DEFINITIONS
+hw.def <- cbind(rep(percentiles[4:6],2),rep(c(2,4),c(3,3)))
+
+main.eff<-added.eff<-matrix(NA,nrow=length(hw.def),1, 
+                            dimnames=list(paste("hw",rep(c(2,4),each=6),rep(c(97,98,99),
+                                                                            each=2),c("est","sd"),sep=".")))
+
+hw.indicator<-matrix(NA,nrow=2191,6)
+colnames(hw.indicator)<-c("hw97.2","hw98.2","hw99.2","hw97.4","hw98.4","hw99.4")
+
+bd$year<-as.factor(format(bd$date, "%Y"))
+
+#Create hw indicator for each hw definition
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.indicator[,k]<-hw
+  hw.N[k] <- sum(hw)
+}
+
+tq<-data.frame(bd[,c("tmean","tmin","tmax","date")],hw.indicator)
+write.csv(tq,"/Users/guest2/Desktop/tq.csv")
+
+# RUN THE MODEL FOR EACH DEFINITION
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(hos2 ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=19)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+tq_hos2<-data.frame(main.eff,added.eff)
+```
+# icd_AB
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_AB ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=19)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+tq_icdAB<-data.frame(main.eff,added.eff)
+```
+# icd_D
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_D ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=19)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+tq_icdD<-data.frame(main.eff,added.eff)
+```
+# icd_E
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_E ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=19)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+tq_icdE<-data.frame(main.eff,added.eff)
+```
+# icd_F
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_F ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=19)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+tq_icdF<-data.frame(main.eff,added.eff)
+```
+# icd_I
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_I ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=19)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+tq_icdI<-data.frame(main.eff,added.eff)
+```
+# icd_J
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_J ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=19)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+tq_icdJ<-data.frame(main.eff,added.eff)
+```
+# icd_K
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_K ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=19)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+tq_icdK<-data.frame(main.eff,added.eff)
+```
+# icd_L
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_L ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=19)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+tq_icdL<-data.frame(main.eff,added.eff)
+```
+
+# icd_N
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_N ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=19)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+tq_icdN<-data.frame(main.eff,added.eff)
+```
+# icd_O
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_O ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=19)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+tq_icdO<-data.frame(main.eff,added.eff)
+```
+
+# icd_P
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_P ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=19)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+tq_icdP<-data.frame(main.eff,added.eff)
+```
+
+# d_0050
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_0050 ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=19)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+tq_d0050<-data.frame(main.eff,added.eff)
+```
+
+# d_51
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_51 ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=19)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+tq_d51<-data.frame(main.eff,added.eff)
+```
+# d_0060
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_0060 ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=19)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+tq_d0060<-data.frame(main.eff,added.eff)
+```
+
+# d_61
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_61 ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=19)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+tq_d61<-data.frame(main.eff,added.eff)
+```
+
+#3. HA TINH
+
+## Heatwave analysis
+load packages, functions and create matrix for storing results
+```{r}
+reg <- "HT"
+nrow(data[[reg]])
+
+# GLM WITH KNOTS SPECIFIED A PRIORI (GASPARRINI BMCmrm 2014)
+library(dlnm) ; library(mgcv) ; library(splines) ; library(tsModel)
+data[[reg]]$Temp<-data[[reg]]$tmean
+# DEFINE THE CROSS-BASIS
+bound <- colMeans(ranges)
+varknots <- equalknots(data[[reg]]$tmean,fun="bs",degree=2,df=3)
+lagknots <- logknots(21,df=5,int=T)
+argvar <- list(fun="bs",degree=2,knots=varknots)
+arglag <- list(fun="ns",knots=lagknots)
+
+suppressWarnings(
+  cb <- crossbasis(data[[reg]]$tmean,lag=21,argvar=argvar,arglag=arglag)
+)
+summary(cb)
+
+# RUN THE MODEL
+model <- glm(hos2 ~ cb + dow + ns(time,df=4*4)+ ns(rh,df=3),
+             family=quasipoisson(),data[[reg]])
+
+
+range<-quantile(data[[reg]]$tmean,c(0.05,0.95),na.rm=TRUE)
+predglm1 <- crosspred(cb,model,at=seq(range[1],range[2],0.1))
+ot<-which.min(predglm1$allRRfit)
+ot
+
+##
+cbglm1 <- crossbasis(data[[reg]]$tmean, lag=21, argvar=list(fun="bs",degree=2,
+                                                            knots=varknots,cen=17), arglag=arglag)
+glm1 <- glm(hos2~cbglm1+ns(time,4*4)+dow+ ns(rh,df=3),family=quasipoisson(),data[[reg]])
+predglm1 <- crosspred(cbglm1,cumul=T,glm1,by=0.1, cen=17)
+
+
+# ESTIMATED EFFECTS AT EACH LAG
+pred1 <- crosspred(cbglm1,glm1, at=18)
+tablag1 <- with(pred1,t(rbind(matRRfit,matRRlow,matRRhigh)))
+tablag1
+
+#RR cua tung nhiet do (commulative lags)
+pred1$allRRfit
+pred1$allRRhigh
+pred1$allRRlow
+
+
+bd<-data[[reg]]
+# LOAD PACKAGES AND FUNCTIONS
+library(dlnm) ; library(splines) ; library(mgcv);require(MASS);require(lmtest)
+require(Epi);require(tsModel)
+require(metafor);require(foreign)
+library("metaforest")
+# FUNCTION TO CREATE AN HEAT WAVE INDICATOR FOR A TEMPERATURE SERIES
+# 	BASED ON THE THRESHOLD AND THE DURATION, BY GROUPS
+fun.hw.thr <- function(x,thr,dur,group=NULL) {
+  as.numeric(apply(Lag(x>=thr,0:(dur-1),group=group),
+                   1,sum,na.rm=T)>(dur-1))
+}
+
+# CREATE THE MATRICES TO STORE THE RESULTS
+#   DESCRIPTIVE STATS
+hw.N <- matrix(NA,6,1, dimnames=list(paste("hw",rep(c(2,4),each=3),rep(c(97,98,99),2),sep=".")))
+hw.cons <- matrix(NA,6,4, dimnames= list(paste("consecutive days",rep(c(2,4),each=3),rep(c(97,98,99),2),sep="."),
+                                         paste(c("N","Max",">3",">7"))))
+```
+
+**First analysis: Indicator for different hw definitions**
+```{r}
+#############################################################
+# FIRST ANALYSIS: INDICATOR FOR DIFFERENT hw DEFINITIONS
+#############################################################
+
+percentiles<-round(quantile(bd$tmean,c(1,3,5,97,98,99)/100,na.rm=T),1)
+range <- round(range(bd$tmean,na.rm=T),1)
+
+# hw DEFINITIONS
+hw.def <- cbind(rep(percentiles[4:6],2),rep(c(2,4),c(3,3)))
+
+main.eff<-added.eff<-matrix(NA,nrow=length(hw.def),1, 
+                            dimnames=list(paste("hw",rep(c(2,4),each=6),rep(c(97,98,99),
+                                                                            each=2),c("est","sd"),sep=".")))
+
+hw.indicator<-matrix(NA,nrow=1461,6)
+colnames(hw.indicator)<-c("hw97.2","hw98.2","hw99.2","hw97.4","hw98.4","hw99.4")
+
+bd$year<-as.factor(format(bd$date, "%Y"))
+
+#Create hw indicator for each hw definition
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.indicator[,k]<-hw
+  hw.N[k] <- sum(hw)
+}
+
+ht<-data.frame(bd[,c("tmean","tmin","tmax","date")],hw.indicator)
+write.csv(ht,"/Users/guest2/Desktop/ht.csv")
+
+# RUN THE MODEL FOR EACH DEFINITION
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(hos2 ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=17)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ht_hos2<-data.frame(main.eff,added.eff)
+```
+
+# icd_AB
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_AB ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=17)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ht_icdAB<-data.frame(main.eff,added.eff)
+```
+# icd_D
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_D ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=17)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ht_icdD<-data.frame(main.eff,added.eff)
+```
+# icd_E
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_E ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=17)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ht_icdE<-data.frame(main.eff,added.eff)
+```
+# icd_F
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_F ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=17)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ht_icdF<-data.frame(main.eff,added.eff)
+```
+# icd_I
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_I ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=17)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ht_icdI<-data.frame(main.eff,added.eff)
+```
+# icd_J
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_J ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=17)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ht_icdJ<-data.frame(main.eff,added.eff)
+```
+# icd_K
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_K ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=17)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ht_icdK<-data.frame(main.eff,added.eff)
+```
+# icd_L
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_L ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=17)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ht_icdL<-data.frame(main.eff,added.eff)
+```
+
+# icd_N
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_N ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=17)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ht_icdN<-data.frame(main.eff,added.eff)
+```
+# icd_O
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_O ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=17)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ht_icdO<-data.frame(main.eff,added.eff)
+```
+
+# icd_P
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_P ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=17)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ht_icdP<-data.frame(main.eff,added.eff)
+```
+
+# d_0050
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_0050 ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=17)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ht_d0050<-data.frame(main.eff,added.eff)
+```
+
+# d_51
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_51 ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=17)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ht_d51<-data.frame(main.eff,added.eff)
+```
+# d_0060
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_0060 ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=17)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ht_d0060<-data.frame(main.eff,added.eff)
+```
+
+# d_61
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_61 ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=17)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ht_d61<-data.frame(main.eff,added.eff)
+```
+
+MIEN BAC
+```{r}
+#all-hos2
+result_hos2<-data.frame(db_hos2, tq_hos2, ht_hos2)
+colnames(result_hos2)<-c("main.db_hos2","add.db_hos2","main.tq_hos2","add.tq_hos2", "main.ht_hos2","add.ht_hos2")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_hos2,"north2_result_allhos2_farmers_20.01.csv")
+
+#icd_AB
+result_icdAB<-data.frame(db_icdAB, tq_icdAB, ht_icdAB)
+colnames(result_icdAB)<-c("main.db_icdAB","add.db_icdAB","main.tq_icdAB","add.tq_icdAB", "main.ht_icdAB","add.ht_icdAB")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdAB,"north2_result_allicdAB_farmers_20.01.csv")
+
+#icdD
+result_icdD<-data.frame(db_icdD, tq_icdD, ht_icdD)
+colnames(result_icdD)<-c("main.db_icdD","add.db_icdD","main.tq_icdD","add.tq_icdD", "main.ht_icdD","add.ht_icdD")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdD,"north2_result_allicdD_farmers_20.01.csv")
+
+#icdE
+result_icdE<-data.frame(db_icdE, tq_icdE, ht_icdE)
+colnames(result_icdE)<-c("main.db_icdE","add.db_icdE","main.tq_icdE","add.tq_icdE", "main.ht_icdE","add.ht_icdE")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdE,"north2_result_allicdE_farmers_20.01.csv")
+
+#icdF
+result_icdF<-data.frame(db_icdF, tq_icdF, ht_icdF)
+colnames(result_icdF)<-c("main.db_icdF","add.db_icdF","main.tq_icdF","add.tq_icdF", "main.ht_icdF","add.ht_icdF")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdF,"north2_result_allicdF_farmers_20.01.csv")
+
+#icdI
+result_icdI<-data.frame(db_icdI, tq_icdI, ht_icdI)
+colnames(result_icdI)<-c("main.db_icdI","add.db_icdI","main.tq_icdI","add.tq_icdI", "main.ht_icdI","add.ht_icdI")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdI,"north2_result_allicdI_farmers_20.01.csv")
+
+#icdJ
+result_icdJ<-data.frame(db_icdJ, tq_icdJ, ht_icdJ)
+colnames(result_icdJ)<-c("main.db_icdJ","add.db_icdJ","main.tq_icdJ","add.tq_icdJ", "main.ht_icdJ","add.ht_icdJ")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdJ,"north2_result_allicdJ_farmers_20.01.csv")
+
+#icdK
+result_icdK<-data.frame(db_icdK, tq_icdK, ht_icdK)
+colnames(result_icdK)<-c("main.db_icdK","add.db_icdK","main.tq_icdK","add.tq_icdK", "main.ht_icdK","add.ht_icdK")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdK,"north2_result_allicdK_farmers_20.01.csv")
+
+#icdL
+result_icdL<-data.frame(db_icdL, tq_icdL, ht_icdL)
+colnames(result_icdL)<-c("main.db_icdL","add.db_icdL","main.tq_icdL","add.tq_icdL", "main.ht_icdL","add.ht_icdL")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdL,"north2_result_allicdL_farmers_20.01.csv")
+
+#icdN
+result_icdN<-data.frame(db_icdN, tq_icdN, ht_icdN)
+colnames(result_icdN)<-c("main.db_icdN","add.db_icdN","main.tq_icdN","add.tq_icdN", "main.ht_icdN","add.ht_icdN")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdN,"north2_result_allicdN_farmers_20.01.csv")
+
+#icdO
+result_icdO<-data.frame(db_icdO, tq_icdO, ht_icdO)
+colnames(result_icdO)<-c("main.db_icdO","add.db_icdO","main.tq_icdO","add.tq_icdO", "main.ht_icdO","add.ht_icdO")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdO,"north2_result_allicdO_farmers_20.01.csv")
+
+#icdP
+result_icdP<-data.frame(db_icdP, tq_icdP, ht_icdP)
+colnames(result_icdP)<-c("main.db_icdP","add.db_icdP","main.tq_icdP","add.tq_icdP", "main.ht_icdP","add.ht_icdP")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdP,"north2_result_allicdP_farmers_20.01.csv")
+
+#d0050
+result_d0050<-data.frame(db_d0050, tq_d0050, ht_d0050)
+colnames(result_d0050)<-c("main.db_d0050","add.db_d0050","main.tq_d0050","add.tq_d0050", "main.ht_d0050","add.ht_d0050")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_d0050,"north2_result_alld0050_farmers_20.01.csv")
+
+#d51
+result_d51<-data.frame(db_d51, tq_d51, ht_d51)
+colnames(result_d51)<-c("main.db_d51","add.db_d51","main.tq_d51","add.tq_d51", "main.ht_d51","add.ht_d51")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_d51,"north2_result_alld51_farmers_20.01.csv")
+
+#d0060
+result_d0060<-data.frame(db_d0060, tq_d0060, ht_d0060)
+colnames(result_d0060)<-c("main.db_d0060","add.db_d0060","main.tq_d0060","add.tq_d0060", "main.ht_d0060","add.ht_d0060")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_d0060,"north2_result_alld0060_farmers_20.01.csv")
+
+#d61
+result_d61<-data.frame(db_d61, tq_d61, ht_d61)
+colnames(result_d61)<-c("main.db_d61","add.db_d61","main.tq_d61","add.tq_d61", "main.ht_d61","add.ht_d61")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_d61,"north2_result_alld61_farmers_20.01.csv")
+
+```
+#MIEN NAM
+#8. VINH LONG
+
+## Heatwave analysis
+load packages, functions and create matrix for storing results
+```{r}
+reg <- "VL"
+nrow(data[[reg]])
+
+# GLM WITH KNOTS SPECIFIED A PRIORI (GASPARRINI BMCmrm 2014)
+library(dlnm) ; library(mgcv) ; library(splines) ; library(tsModel)
+data[[reg]]$Temp<-data[[reg]]$tmean
+# DEFINE THE CROSS-BASIS
+bound <- colMeans(ranges)
+varknots <- equalknots(data[[reg]]$tmean,fun="bs",degree=2,df=3)
+lagknots <- logknots(21,df=5,int=T)
+argvar <- list(fun="bs",degree=2,knots=varknots)
+arglag <- list(fun="ns",knots=lagknots)
+
+suppressWarnings(
+  cb <- crossbasis(data[[reg]]$tmean,lag=21,argvar=argvar,arglag=arglag)
+)
+summary(cb)
+
+# RUN THE MODEL
+model <- glm(hos2 ~ cb + dow + ns(time,df=8*4)+ ns(rh,df=3),
+             family=quasipoisson(),data[[reg]])
+
+
+range<-quantile(data[[reg]]$tmean,c(0.05,0.95),na.rm=TRUE)
+predglm1 <- crosspred(cb,model,at=seq(range[1],range[2],0.1))
+ot<-which.min(predglm1$allRRfit)
+ot
+
+##
+cbglm1 <- crossbasis(data[[reg]]$tmean, lag=21, argvar=list(fun="bs",degree=2,
+                                                            knots=varknots,cen=25.5), arglag=arglag)
+glm1 <- glm(hos2~cbglm1+ns(time,8*4)+dow+ ns(rh,df=3),family=quasipoisson(),data[[reg]])
+predglm1 <- crosspred(cbglm1,cumul=T,glm1,by=0.1, cen=25.5)
+
+
+# ESTIMATED EFFECTS AT EACH LAG
+pred1 <- crosspred(cbglm1,glm1, at=26.5)
+tablag1 <- with(pred1,t(rbind(matRRfit,matRRlow,matRRhigh)))
+tablag1
+
+#RR cua tung nhiet do (commulative lags)
+pred1$allRRfit
+pred1$allRRhigh
+pred1$allRRlow
+
+
+bd<-data[[reg]]
+# LOAD PACKAGES AND FUNCTIONS
+library(dlnm) ; library(splines) ; library(mgcv);require(MASS);require(lmtest)
+require(Epi);require(tsModel)
+require(metafor);require(foreign)
+library("metaforest")
+# FUNCTION TO CREATE AN HEAT WAVE INDICATOR FOR A TEMPERATURE SERIES
+# 	BASED ON THE THRESHOLD AND THE DURATION, BY GROUPS
+fun.hw.thr <- function(x,thr,dur,group=NULL){
+  as.numeric(apply(Lag(x>=thr,0:(dur-1),group=group),
+                   1,sum,na.rm=T)>(dur-1))
+}
+
+# CREATE THE MATRICES TO STORE THE RESULTS
+#   DESCRIPTIVE STATS
+hw.N <- matrix(NA,6,1, dimnames=list(paste("hw",rep(c(2,4),each=3),rep(c(97,98,99),2),sep=".")))
+hw.cons <- matrix(NA,6,4, dimnames= list(paste("consecutive days",rep(c(2,4),each=3),rep(c(97,98,99),2),sep="."),
+                                         paste(c("N","Max",">3",">7"))))
+```
+
+**First analysis: Indicator for different hw definitions**
+```{r}
+#############################################################
+# FIRST ANALYSIS: INDICATOR FOR DIFFERENT hw DEFINITIONS
+#############################################################
+
+percentiles<-round(quantile(bd$tmean,c(1,3,5,97,98,99)/100,na.rm=T),1)
+range <- round(range(bd$tmean,na.rm=T),1)
+
+# hw DEFINITIONS
+hw.def <- cbind(rep(percentiles[4:6],2),rep(c(2,4),c(3,3)))
+
+main.eff<-added.eff<-matrix(NA,nrow=length(hw.def),1, 
+                            dimnames=list(paste("hw",rep(c(2,4),each=6),rep(c(97,98,99),
+                                                                            each=2),c("est","sd"),sep=".")))
+
+hw.indicator<-matrix(NA,nrow=2922,6)
+colnames(hw.indicator)<-c("hw97.2","hw98.2","hw99.2","hw97.4","hw98.4","hw99.4")
+
+bd$year<-as.factor(format(bd$date, "%Y"))
+
+#Create hw indicator for each hw definition
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.indicator[,k]<-hw
+  hw.N[k] <- sum(hw)
+}
+
+vl<-data.frame(bd[,c("tmean","tmin","tmax","date")],hw.indicator)
+write.csv(vl,"/Users/guest2/Desktop/vl.csv")
+
+# RUN THE MODEL FOR EACH DEFINITION
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(hos2 ~ hw +  cbglm1+ns(time,8*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25.5)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+vl_hos2<-data.frame(main.eff,added.eff)
+```
+
+# icd_AB
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_AB ~ hw +  cbglm1+ns(time,8*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25.5)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+vl_icdAB<-data.frame(main.eff,added.eff)
+```
+# icd_D
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINIITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_D ~ hw +  cbglm1+ns(time,8*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25.5)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+vl_icdD<-data.frame(main.eff,added.eff)
+```
+# icd_E
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_E ~ hw +  cbglm1+ns(time,8*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25.5)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+vl_icdE<-data.frame(main.eff,added.eff)
+```
+# icd_F
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_F ~ hw +  cbglm1+ns(time,8*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25.5)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+vl_icdF<-data.frame(main.eff,added.eff)
+```
+# icd_I
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_I ~ hw +  cbglm1+ns(time,8*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25.5)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,N)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+vl_icdI<-data.frame(main.eff,added.eff)
+```
+# icd_J
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_J ~ hw +  cbglm1+ns(time,8*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25.5)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+vl_icdJ<-data.frame(main.eff,added.eff)
+```
+# icd_K
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_K ~ hw +  cbglm1+ns(time,8*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25.5)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+vl_icdK<-data.frame(main.eff,added.eff)
+```
+# icd_L
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_L ~ hw +  cbglm1+ns(time,8*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25.5)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+vl_icdL<-data.frame(main.eff,added.eff)
+```
+
+# icd_N
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_N ~ hw +  cbglm1+ns(time,8*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25.5)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+vl_icdN<-data.frame(main.eff,added.eff)
+```
+# icd_O
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_O ~ hw +  cbglm1+ns(time,8*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25.5)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+vl_icdO<-data.frame(main.eff,added.eff)
+```
+
+# icd_P
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_P ~ hw +  cbglm1+ns(time,8*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25.5)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+vl_icdP<-data.frame(main.eff,added.eff)
+```
+
+# d_0050
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_0050 ~ hw +  cbglm1+ns(time,8*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25.5)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+vl_d0050<-data.frame(main.eff,added.eff)
+```
+
+# d_51
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_51 ~ hw +  cbglm1+ns(time,8*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25.5)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+vl_d51<-data.frame(main.eff,added.eff)
+```
+# d_0060
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_0060 ~ hw +  cbglm1+ns(time,8*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25.5)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+vl_d0060<-data.frame(main.eff,added.eff)
+```
+
+# d_61
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_61 ~ hw +  cbglm1+ns(time,8*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25.5)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+vl_d61<-data.frame(main.eff,added.eff)
+```
+#5. AN GIANG
+
+## Heatwave analysis
+load packages, functions and create matrix for storing results
+```{r}
+reg <- "AG"
+nrow(data[[reg]])
+
+# GLM WITH KNOTS SPECIFIED A PRIORI (GASPARRINI BMCmrm 2014)
+library(dlnm) ; library(mgcv) ; library(splines) ; library(tsModel)
+data[[reg]]$Temp<-data[[reg]]$tmean
+# DEFINE THE CROSS-BASIS
+bound <- colMeans(ranges)
+varknots <- equalknots(data[[reg]]$tmean,fun="bs",degree=2,df=3)
+lagknots <- logknots(21,df=5,int=T)
+argvar <- list(fun="bs",degree=2,knots=varknots)
+arglag <- list(fun="ns",knots=lagknots)
+
+suppressWarnings(
+  cb <- crossbasis(data[[reg]]$tmean,lag=21,argvar=argvar,arglag=arglag)
+)
+summary(cb)
+
+# RUN THE MODEL
+model <- glm(hos2 ~ cb + dow + ns(time,df=4*4)+ ns(rh,df=3),
+             family=quasipoisson(),data[[reg]])
+
+
+range<-quantile(data[[reg]]$tmean,c(0.05,0.95),na.rm=TRUE)
+predglm1 <- crosspred(cb,model,at=seq(range[1],range[2],0.1))
+ot<-which.min(predglm1$allRRfit)
+ot
+
+##
+cbglm1 <- crossbasis(data[[reg]]$tmean, lag=21, argvar=list(fun="bs",degree=2,
+                                                            knots=varknots,cen=25), arglag=arglag)
+glm1 <- glm(hos2~cbglm1+ns(time,4*4)+dow+ ns(rh,df=3),family=quasipoisson(),data[[reg]])
+predglm1 <- crosspred(cbglm1,cumul=T,glm1,by=0.1, cen=25)
+
+
+# ESTIMATED EFFECTS AT EACH LAG
+pred1 <- crosspred(cbglm1,glm1, at=26)
+tablag1 <- with(pred1,t(rbind(matRRfit,matRRlow,matRRhigh)))
+tablag1
+
+#RR cua tung nhiet do (commulative lags)
+pred1$allRRfit
+pred1$allRRhigh
+pred1$allRRlow
+
+
+bd<-data[[reg]]
+# LOAD PACKAGES AND FUNCTIONS
+library(dlnm) ; library(splines) ; library(mgcv);require(MASS);require(lmtest)
+require(Epi);require(tsModel)
+require(metafor);require(foreign)
+library("metaforest")
+# FUNCTION TO CREATE AN HEAT WAVE INDICATOR FOR A TEMPERATURE SERIES
+# 	BASED ON THE THRESHOLD AND THE DURATION, BY GROUPS
+fun.hw.thr <- function(x,thr,dur,group=NULL) {
+  as.numeric(apply(Lag(x>=thr,0:(dur-1),group=group),
+                   1,sum,na.rm=T)>(dur-1))
+}
+
+# CREATE THE MATRICES TO STORE THE RESULTS
+#   DESCRIPTIVE STATS
+hw.N <- matrix(NA,6,1, dimnames=list(paste("hw",rep(c(2,4),each=3),rep(c(97,98,99),2),sep=".")))
+hw.cons <- matrix(NA,6,4, dimnames= list(paste("consecutive days",rep(c(2,4),each=3),rep(c(97,98,99),2),sep="."),
+                                         paste(c("N","Max",">3",">7"))))
+```
+
+**First analysis: Indicator for different hw definitions**
+```{r}
+#############################################################
+# FIRST ANALYSIS: INDICATOR FOR DIFFERENT hw DEFINITIONS
+#############################################################
+
+percentiles<-round(quantile(bd$tmean,c(1,3,5,97,98,99)/100,na.rm=T),1)
+range <- round(range(bd$tmean,na.rm=T),1)
+
+# hw DEFINITIONS
+hw.def <- cbind(rep(percentiles[4:6],2),rep(c(2,4),c(3,3)))
+
+main.eff<-added.eff<-matrix(NA,nrow=length(hw.def),1, 
+                            dimnames=list(paste("hw",rep(c(2,4),each=6),rep(c(97,98,99),
+                                                                            each=2),c("est","sd"),sep=".")))
+
+hw.indicator<-matrix(NA,nrow=1461,6)
+colnames(hw.indicator)<-c("hw97.2","hw98.2","hw99.2","hw97.4","hw98.4","hw99.4")
+
+bd$year<-as.factor(format(bd$date, "%Y"))
+
+#Create hw indicator for each hw definition
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.indicator[,k]<-hw
+  hw.N[k] <- sum(hw)
+}
+
+ag<-data.frame(bd[,c("tmean","tmin","tmax","date")],hw.indicator)
+write.csv(ag,"/Users/guest2/Desktop/ag.csv")
+
+# RUN THE MODEL FOR EACH DEFINITION
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(hos2 ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ag_hos2<-data.frame(main.eff,added.eff)
+```
+
+# icd_AB
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_AB ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ag_icdAB<-data.frame(main.eff,added.eff)
+```
+# icd_D
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_D ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ag_icdD<-data.frame(main.eff,added.eff)
+```
+# icd_E
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_E ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ag_icdE<-data.frame(main.eff,added.eff)
+```
+# icd_F
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_F ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ag_icdF<-data.frame(main.eff,added.eff)
+```
+# icd_I
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_I ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ag_icdI<-data.frame(main.eff,added.eff)
+```
+# icd_J
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_J ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ag_icdJ<-data.frame(main.eff,added.eff)
+```
+# icd_K
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_K ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ag_icdK<-data.frame(main.eff,added.eff)
+```
+# icd_L
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_L ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ag_icdL<-data.frame(main.eff,added.eff)
+```
+
+# icd_N
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_N ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ag_icdN<-data.frame(main.eff,added.eff)
+```
+# icd_O
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_O ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ag_icdO<-data.frame(main.eff,added.eff)
+```
+
+# icd_P
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_P ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ag_icdP<-data.frame(main.eff,added.eff)
+```
+
+# d_0050
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_0050 ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ag_d0050<-data.frame(main.eff,added.eff)
+```
+
+# d_51
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_51 ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ag_d51<-data.frame(main.eff,added.eff)
+```
+# d_0060
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_0060 ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ag_d0060<-data.frame(main.eff,added.eff)
+```
+
+# d_61
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_61 ~ hw +  cbglm1+ns(time,4*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=25)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+ag_d61<-data.frame(main.eff,added.eff)
+```
+
+
+#6. BINH PHUOC
+
+## Heatwave analysis
+load packages, functions and create matrix for storing results
+```{r}
+reg <- "BP"
+nrow(data[[reg]])
+
+# GLM WITH KNOTS SPECIFIED A PRIORI (GASPARRINI BMCmrm 2014)
+library(dlnm) ; library(mgcv) ; library(splines) ; library(tsModel)
+data[[reg]]$Temp<-data[[reg]]$tmean
+# DEFINE THE CROSS-BASIS
+bound <- colMeans(ranges)
+varknots <- equalknots(data[[reg]]$tmean,fun="bs",degree=2,df=3)
+lagknots <- logknots(21,df=5,int=T)
+argvar <- list(fun="bs",degree=2,knots=varknots)
+arglag <- list(fun="ns",knots=lagknots)
+
+suppressWarnings(
+  cb <- crossbasis(data[[reg]]$tmean,lag=21,argvar=argvar,arglag=arglag)
+)
+summary(cb)
+
+# RUN THE MODEL
+model <- glm(hos2 ~ cb + dow + ns(time,df=6*4)+ ns(rh,df=3),
+             family=quasipoisson(),data[[reg]])
+
+
+range<-quantile(data[[reg]]$tmean,c(0.05,0.95),na.rm=TRUE)
+predglm1 <- crosspred(cb,model,at=seq(range[1],range[2],0.1))
+ot<-which.min(predglm1$allRRfit)
+ot
+
+##
+cbglm1 <- crossbasis(data[[reg]]$tmean, lag=21, argvar=list(fun="bs",degree=2,
+                                                            knots=varknots,cen=26), arglag=arglag)
+glm1 <- glm(hos2~cbglm1+ns(time,6*4)+dow+ ns(rh,df=3),family=quasipoisson(),data[[reg]])
+predglm1 <- crosspred(cbglm1,cumul=T,glm1,by=0.1, cen=26)
+
+
+# ESTIMATED EFFECTS AT EACH LAG
+pred1 <- crosspred(cbglm1,glm1, at=27)
+tablag1 <- with(pred1,t(rbind(matRRfit,matRRlow,matRRhigh)))
+tablag1
+
+#RR cua tung nhiet do (commulative lags)
+pred1$allRRfit
+pred1$allRRhigh
+pred1$allRRlow
+
+
+bd<-data[[reg]]
+# LOAD PACKAGES AND FUNCTIONS
+library(dlnm) ; library(splines) ; library(mgcv);require(MASS);require(lmtest)
+require(Epi);require(tsModel)
+require(metafor);require(foreign)
+library("metaforest")
+# FUNCTION TO CREATE AN HEAT WAVE INDICATOR FOR A TEMPERATURE SERIES
+# 	BASED ON THE THRESHOLD AND THE DURATION, BY GROUPS
+fun.hw.thr <- function(x,thr,dur,group=NULL) {
+  as.numeric(apply(Lag(x>=thr,0:(dur-1),group=group),
+                   1,sum,na.rm=T)>(dur-1))
+}
+
+# CREATE THE MATRICES TO STORE THE RESULTS
+#   DESCRIPTIVE STATS
+hw.N <- matrix(NA,6,1, dimnames=list(paste("hw",rep(c(2,4),each=3),rep(c(97,98,99),2),sep=".")))
+hw.cons <- matrix(NA,6,4, dimnames= list(paste("consecutive days",rep(c(2,4),each=3),rep(c(97,98,99),2),sep="."),
+                                         paste(c("N","Max",">3",">7"))))
+```
+
+**First analysis: Indicator for different hw definitions**
+```{r}
+#############################################################
+# FIRST ANALYSIS: INDICATOR FOR DIFFERENT hw DEFINITIONS
+#############################################################
+
+percentiles<-round(quantile(bd$tmean,c(1,3,5,97,98,99)/100,na.rm=T),1)
+range <- round(range(bd$tmean,na.rm=T),1)
+
+# hw DEFINITIONS
+hw.def <- cbind(rep(percentiles[4:6],2),rep(c(2,4),c(3,3)))
+
+main.eff<-added.eff<-matrix(NA,nrow=length(hw.def),1, 
+                            dimnames=list(paste("hw",rep(c(2,4),each=6),rep(c(97,98,99),
+                                                                            each=2),c("est","sd"),sep=".")))
+
+hw.indicator<-matrix(NA,nrow=2192,6)
+colnames(hw.indicator)<-c("hw97.2","hw98.2","hw99.2","hw97.4","hw98.4","hw99.4")
+
+bd$year<-as.factor(format(bd$date, "%Y"))
+
+#Create hw indicator for each hw definition
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.indicator[,k]<-hw
+  hw.N[k] <- sum(hw)
+}
+
+bp<-data.frame(bd[,c("tmean","tmin","tmax","date")],hw.indicator)
+write.csv(bp,"/Users/guest2/Desktop/bp.csv")
+
+# RUN THE MODEL FOR EACH DEFINITION
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(hos2 ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=26)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+bp_hos2<-data.frame(main.eff,added.eff)
+```
+
+# icd_AB
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_AB ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=26)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+bp_icdAB<-data.frame(main.eff,added.eff)
+```
+# icd_D
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_D ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=26)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+bp_icdD<-data.frame(main.eff,added.eff)
+```
+# icd_E
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_E ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=26)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+bp_icdE<-data.frame(main.eff,added.eff)
+```
+# icd_F
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_F ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=26)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+bp_icdF<-data.frame(main.eff,added.eff)
+```
+# icd_I
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_I ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=26)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+bp_icdI<-data.frame(main.eff,added.eff)
+```
+# icd_J
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_J ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=26)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+bp_icdJ<-data.frame(main.eff,added.eff)
+```
+# icd_K
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_K ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=26)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+bp_icdK<-data.frame(main.eff,added.eff)
+```
+# icd_L
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_L ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=26)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+bp_icdL<-data.frame(main.eff,added.eff)
+```
+
+# icd_N
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_N ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=26)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+bp_icdN<-data.frame(main.eff,added.eff)
+```
+# icd_O
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_O ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=26)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+bp_icdO<-data.frame(main.eff,added.eff)
+```
+
+# icd_P
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(icd_P ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=26)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+bp_icdP<-data.frame(main.eff,added.eff)
+```
+
+# d_0050
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_0050 ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=26)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+bp_d0050<-data.frame(main.eff,added.eff)
+```
+
+# d_51
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_51 ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=26)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+bp_d51<-data.frame(main.eff,added.eff)
+```
+# d_0060
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_0060 ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=26)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+bp_d0060<-data.frame(main.eff,added.eff)
+```
+
+# d_61
+# RUN THE MODEL FOR EACH DEFINITION
+```{r}
+for(k in 1:nrow(hw.def)) {
+  
+  # CREATE HEATWAVES INDICATOR FOR THE SPECIFIC hw DEFINITION
+  hw <- fun.hw.thr(bd$tmean,hw.def[k,1],hw.def[k,2],bd$year)
+  hw.N[k] <- sum(hw)
+  
+  
+  # RUN THE MODEL
+  model.first <- glm(d_61 ~ hw +  cbglm1+ns(time,6*4)+dow+ ns(rh,df=3) , family=quasipoisson(), bd) #check if anything change when include dow
+  
+  # SAVE MAIN EFFECT= RR between median of temperatures in heat wave days and OT
+  if(sum(hw)>0) {
+    tmedian <- median(bd$tmean[hw==1],na.rm=T)
+    pred <- crosspred(cbglm1,model.first,
+                      at=c((range[1]+1):(range[2]-0),tmedian),cen=26)
+    main.eff[c(k*2-1,k*2)] <- cbind(pred$allfit,pred$allse)[as.character(tmedian),]
+  } else main.eff[c(k*2-1,k*2)]<- c(NA,NA)
+  # SAVE ADDED EFFECT
+  added.eff[c(k*2-1,k*2)] <- ci.lin(model.first)["hw",1:2]
+}
+
+#RR= exp(est)
+# 95% CI= exp(est+-sd)
+```
+
+**Report main and add effect of heatwave on all-cause hos2pitalization**
+```{r}
+require(knitr)
+colnames(main.eff)<-"main effect"
+kable(main.eff)
+colnames(added.eff)<-"added effect"
+kable(added.eff)
+bp_d61<-data.frame(main.eff,added.eff)
+```
+#MIEN NAM
+```{r}
+#all-hos2
+result_hos2<-data.frame(vl_hos2,ag_hos2, bp_hos2)
+colnames(result_hos2)<-c("main.vl_hos2","add.vl_hos2", "main.ag_hos2","add.ag_hos2", "main.bp_hos2","add.bp_hos2")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_hos2,"south2_result_allhos2_farmers_20.01.csv")
+
+#icd_AB
+result_icdAB<-data.frame(vl_icdAB,ag_icdAB, bp_icdAB)
+colnames(result_icdAB)<-c("main.vl_icdAB","add.vl_icdAB", "main.ag_icdAB","add.ag_icdAB", "main.bp_icdAB","add.bp_icdAB")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdAB,"south2_result_allicdAB_farmers_20.01.csv")
+
+#icdD
+result_icdD<-data.frame(vl_icdD,ag_icdD, bp_icdD)
+colnames(result_icdD)<-c("main.vl_icdD","add.vl_icdD", "main.ag_icdD","add.ag_icdD", "main.bp_icdD","add.bp_icdD")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdD,"south2_result_allicdD_farmers_20.01.csv")
+
+#icdE
+result_icdE<-data.frame( vl_icdE,ag_icdE, bp_icdE)
+colnames(result_icdE)<-c("main.vl_icdE","add.vl_icdE", "main.ag_icdE","add.ag_icdE", "main.bp_icdE","add.bp_icdE")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdE,"south2_result_allicdE_farmers_20.01.csv")
+
+#icdF
+result_icdF<-data.frame( vl_icdF,ag_icdF, bp_icdF)
+colnames(result_icdF)<-c("main.vl_icdF","add.vl_icdF", "main.ag_icdF","add.ag_icdF", "main.bp_icdF","add.bp_icdF")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdF,"south2_result_allicdF_farmers_20.01.csv")
+
+#icdI
+result_icdI<-data.frame( vl_icdI,ag_icdI, bp_icdI)
+colnames(result_icdI)<-c("main.vl_icdI","add.vl_icdI", "main.ag_icdI","add.ag_icdI", "main.bp_icdI","add.bp_icdI")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdI,"south2_result_allicdI_farmers_20.01.csv")
+
+#icdJ
+result_icdJ<-data.frame( vl_icdJ,ag_icdJ, bp_icdJ)
+colnames(result_icdJ)<-c("main.vl_icdJ","add.vl_icdJ", "main.ag_icdJ","add.ag_icdJ", "main.bp_icdJ","add.bp_icdJ")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdJ,"south2_result_allicdJ_farmers_20.01.csv")
+
+#icdK
+result_icdK<-data.frame( vl_icdK,ag_icdK, bp_icdK)
+colnames(result_icdK)<-c("main.vl_icdK","add.vl_icdK", "main.ag_icdK","add.ag_icdK", "main.bp_icdK","add.bp_icdK")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdK,"south2_result_allicdK_farmers_20.01.csv")
+
+#icdL
+result_icdL<-data.frame( vl_icdL,ag_icdL, bp_icdL)
+colnames(result_icdL)<-c("main.vl_icdL","add.vl_icdL", "main.ag_icdL","add.ag_icdL", "main.bp_icdL","add.bp_icdL")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdL,"south2_result_allicdL_farmers_20.01.csv")
+
+#icdN
+result_icdN<-data.frame(vl_icdN,ag_icdN, bp_icdN)
+colnames(result_icdN)<-c("main.vl_icdN","add.vl_icdN", "main.ag_icdN","add.ag_icdN", "main.bp_icdN","add.bp_icdN")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdN,"south2_result_allicdN_farmers_20.01.csv")
+
+#icdO
+result_icdO<-data.frame(vl_icdO,ag_icdO, bp_icdO)
+colnames(result_icdO)<-c("main.vl_icdO","add.vl_icdO", "main.ag_icdO","add.ag_icdO", "main.bp_icdO","add.bp_icdO")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdO,"south2_result_allicdO_farmers_20.01.csv")
+
+#icdP
+result_icdP<-data.frame( vl_icdP,ag_icdP, bp_icdP)
+colnames(result_icdP)<-c("main.vl_icdP","add.vl_icdP", "main.ag_icdP","add.ag_icdP", "main.bp_icdP","add.bp_icdP")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdP,"south2_result_allicdP_farmers_20.01.csv")
+
+#d0050
+result_d0050<-data.frame( vl_d0050,ag_d0050, bp_d0050)
+colnames(result_d0050)<-c("main.vl_d0050","add.vl_d0050", "main.ag_d0050","add.ag_d0050", "main.bp_d0050","add.bp_d0050")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_d0050,"south2_result_alld0050_farmers_20.01.csv")
+
+#d51
+result_d51<-data.frame(vl_d51,ag_d51, bp_d51)
+colnames(result_d51)<-c("main.vl_d51","add.vl_d51", "main.ag_d51","add.ag_d51", "main.bp_d51","add.bp_d51")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_d51,"south2_result_alld51_farmers_20.01.csv")
+
+#d0060
+result_d0060<-data.frame( vl_d0060,ag_d0060, bp_d0060)
+colnames(result_d0060)<-c("main.vl_d0060","add.vl_d0060", "main.ag_d0060","add.ag_d0060", "main.bp_d0060","add.bp_d0060")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_d0060,"south2_result_alld0060_farmers_20.01.csv")
+
+#d61
+result_d61<-data.frame(vl_d61,ag_d61, bp_d61)
+colnames(result_d61)<-c("main.vl_d61","add.vl_d61", "main.ag_d61","add.ag_d61", "main.bp_d61","add.bp_d61")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_d61,"south2_result_alld61_farmers_20.01.csv")
+```
+## Combine all the results
+```{r}
+result_hos2<-data.frame(
+  db_hos2,db_icdAB,db_icdD,db_icdE,db_icdF,db_icdI,db_icdJ,db_icdK,db_icdL,db_icdN,db_icdO,db_icdP,db_d0050,db_d51,db_d0060,db_d61,
+  tq_hos2,tq_icdAB,tq_icdD,tq_icdE,tq_icdF,tq_icdI,tq_icdJ,tq_icdK,tq_icdL,tq_icdN,tq_icdO,tq_icdP,tq_d0050,tq_d51,tq_d0060,tq_d61,
+  
+  ht_hos2,ht_icdAB,ht_icdD,ht_icdE,ht_icdF,ht_icdI,ht_icdJ,ht_icdK,ht_icdL,ht_icdN,ht_icdO,ht_icdP,ht_d0050,ht_d51,ht_d0060,ht_d61,
+  
+  vl_hos2,vl_icdAB,vl_icdD,vl_icdE,vl_icdF,vl_icdI,vl_icdJ,vl_icdK,vl_icdL,vl_icdN,vl_icdO,vl_icdP,vl_d0050,vl_d51,vl_d0060,vl_d61,
+  ag_hos2,ag_icdAB,ag_icdD,ag_icdE,ag_icdF,ag_icdI,ag_icdJ,ag_icdK,ag_icdL,ag_icdN,ag_icdO,ag_d0050,ag_d51,ag_d0060,ag_d61,
+  bp_hos2,bp_icdAB,bp_icdD,bp_icdE,bp_icdF,bp_icdI,bp_icdJ,bp_icdK,bp_icdL,bp_icdN,bp_icdO,bp_icdP,bp_d0050,bp_d51,bp_d0060,bp_d61)
+
+colnames(result_hos2)<-c(
+  "main.db_hos2","add.db_hos2","main.db_icdAB","add.db_icdAB","main.db_icdD","add.db_icdD","main.db_icdE","add.db_icdE","main.db_icdF","add.db_icdF","main.db_icdI","add.db_icdI","main.db_icdJ","add.db_icdJ","main.db_icdK","add.db_icdK","main.db_icdL","add.db_icdL","main.db_icdN","add.db_icdN","main.db_icdO","add.db_icdO","main.db_icdP","add.db_icdP","main.db_d0050","add.db_d0050","main.db_d51","add.db_d51","main.db_d0060","add.db_d0060","main.db_d61","add.db_d61",
+  
+  "main.tq_hos2","add.tq_hos2","main.tq_icdAB","add.tq_icdAB","main.tq_icdD","add.tq_icdD","main.tq_icdE","add.tq_icdE","main.tq_icdF","add.tq_icdF","main.tq_icdI","add.tq_icdI","main.tq_icdJ","add.tq_icdJ","main.tq_icdK","add.tq_icdK","main.tq_icdL","add.tq_icdL","main.tq_icdN","add.tq_icdN","main.tq_icdO","add.tq_icdO","main.tq_icdP","add.tq_icdP","main.tq_d0050","add.tq_d0050","main.tq_d51","add.tq_d51","main.tq_d0060","add.tq_d0060","main.tq_d61","add.tq_d61",
+  
+  "main.ht_hos2","add.ht_hos2","main.ht_icdAB","add.ht_icdAB","main.ht_icdD","add.ht_icdD","main.ht_icdE","add.ht_icdE","main.ht_icdF","add.ht_icdF","main.ht_icdI","add.ht_icdI","main.ht_icdJ","add.ht_icdJ","main.ht_icdK","add.ht_icdK","main.ht_icdL","add.ht_icdL","main.ht_icdN","add.ht_icdN","main.ht_icdO","add.ht_icdO","main.ht_icdP","add.ht_icdP","main.ht_d0050","add.ht_d0050","main.ht_d51","add.ht_d51","main.ht_d0060","add.ht_d0060","main.ht_d61","add.ht_d61",
+  
+  "main.vl_hos2","add.vl_hos2","main.vl_icdAB","add.vl_icdAB","main.vl_icdD","add.vl_icdD","main.vl_icdE","add.vl_icdE","main.vl_icdF","add.vl_icdF","main.vl_icdI","add.vl_icdI","main.vl_icdJ","add.vl_icdJ","main.vl_icdK","add.vl_icdK","main.vl_icdL","add.vl_icdL","main.vl_icdN","add.vl_icdN","main.vl_icdO","add.vl_icdO","main.vl_icdP","add.vl_icdP","main.vl_d0050","add.vl_d0050","main.vl_d51","add.vl_d51","main.vl_d0060","add.vl_d0060","main.vl_d61","add.vl_d61",
+  
+  "main.ag_hos2","add.ag_hos2","main.ag_icdAB","add.ag_icdAB","main.ag_icdD","add.ag_icdD","main.ag_icdE","add.ag_icdE","main.ag_icdF","add.ag_icdF","main.ag_icdI","add.ag_icdI","main.ag_icdJ","add.ag_icdJ","main.ag_icdK","add.ag_icdK","main.ag_icdL","add.ag_icdL","main.ag_icdN","add.ag_icdN","main.ag_icdO","add.ag_icdO","main.ag_d0050","add.ag_d0050","main.ag_d51","add.ag_d51","main.ag_d0060","add.ag_d0060","main.ag_d61","add.ag_d61",
+  
+  "main.bp_hos2","add.bp_hos2","main.bp_icdAB","add.bp_icdAB","main.bp_icdD","add.bp_icdD","main.bp_icdE","add.bp_icdE","main.bp_icdF","add.bp_icdF","main.bp_icdI","add.bp_icdI","main.bp_icdJ","add.bp_icdJ","main.bp_icdK","add.bp_icdK","main.bp_icdL","add.bp_icdL","main.bp_icdN","add.bp_icdN","main.bp_icdO","add.bp_icdO","main.bp_icdP","add.bp_icdP","main.bp_d0050","add.bp_d0050","main.bp_d51","add.bp_d51","main.bp_d0060","add.bp_d0060","main.bp_d61","add.bp_d61")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_hos2,"all2_result_hw_farmers_20.01.csv")
+
+#--------------------------------------------------------------------------------
+  
+#all-hos2
+result_hos2<-data.frame(db_hos2,tq_hos2,ht_hos2,vl_hos2,ag_hos2, bp_hos2)
+colnames(result_hos2)<-c("main.db_hos2","add.db_hos2","main.tq_hos2","add.tq_hos2", "main.ht_hos2","add.ht_hos2","main.vl_hos2","add.vl_hos2", "main.ag_hos2","add.ag_hos2", "main.bp_hos2","add.bp_hos2")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_hos2,"allhos2_result_farmers_20.01.csv")
+
+#icd_AB
+result_icdAB<-data.frame(db_icdAB,tq_icdAB,ht_icdAB,vl_icdAB,ag_icdAB, bp_icdAB)
+colnames(result_icdAB)<-c("main.db_icdAB","add.db_icdAB","main.tq_icdAB","add.tq_icdAB", "main.ht_icdAB","add.ht_icdAB","main.vl_icdAB","add.vl_icdAB", "main.ag_icdAB","add.ag_icdAB", "main.bp_icdAB","add.bp_icdAB")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdAB,"icdAB2_result_farmers_20.01.csv")
+
+#icdD
+result_icdD<-data.frame(db_icdD,tq_icdD,ht_icdD,vl_icdD,ag_icdD, bp_icdD)
+colnames(result_icdD)<-c("main.db_icdD","add.db_icdD","main.tq_icdD","add.tq_icdD", "main.ht_icdD","add.ht_icdD","main.vl_icdD","add.vl_icdD", "main.ag_icdD","add.ag_icdD", "main.bp_icdD","add.bp_icdD")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdD,"icdD2_result_farmers_20.01.csv")
+
+#icdE
+result_icdE<-data.frame(db_icdE,tq_icdE,ht_icdE,vl_icdE,ag_icdE, bp_icdE)
+colnames(result_icdE)<-c("main.db_icdE","add.db_icdE","main.tq_icdE","add.tq_icdE", "main.ht_icdE","add.ht_icdE","main.vl_icdE","add.vl_icdE", "main.ag_icdE","add.ag_icdE", "main.bp_icdE","add.bp_icdE")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdE,"icdE2_result_farmers_20.01.csv")
+
+#icdF
+result_icdF<-data.frame(db_icdF,tq_icdF,ht_icdF,vl_icdF,ag_icdF, bp_icdF)
+colnames(result_icdF)<-c("main.db_icdF","add.db_icdF","main.tq_icdF","add.tq_icdF", "main.ht_icdF","add.ht_icdF","main.vl_icdF","add.vl_icdF", "main.ag_icdF","add.ag_icdF", "main.bp_icdF","add.bp_icdF")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdF,"icdF2_result_farmers_20.01.csv")
+
+#icdI
+result_icdI<-data.frame(db_icdI,tq_icdI,ht_icdI,vl_icdI,ag_icdI, bp_icdI)
+colnames(result_icdI)<-c("main.db_icdI","add.db_icdI","main.tq_icdI","add.tq_icdI", "main.ht_icdI","add.ht_icdI","main.vl_icdI","add.vl_icdI", "main.ag_icdI","add.ag_icdI", "main.bp_icdI","add.bp_icdI")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdI,"icdI2_result_farmers_20.01.csv")
+
+#icdJ
+result_icdJ<-data.frame(db_icdJ,tq_icdJ,ht_icdJ,vl_icdJ,ag_icdJ, bp_icdJ)
+colnames(result_icdJ)<-c("main.db_icdJ","add.db_icdJ","main.tq_icdJ","add.tq_icdJ", "main.ht_icdJ","add.ht_icdJ","main.vl_icdJ","add.vl_icdJ", "main.ag_icdJ","add.ag_icdJ", "main.bp_icdJ","add.bp_icdJ")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdJ,"icdJ2_result_farmers_20.01.csv")
+
+#icdK
+result_icdK<-data.frame(db_icdK,tq_icdK,ht_icdK,vl_icdK,ag_icdK, bp_icdK)
+colnames(result_icdK)<-c("main.db_icdK","add.db_icdK","main.tq_icdK","add.tq_icdK", "main.ht_icdK","add.ht_icdK","main.vl_icdK","add.vl_icdK", "main.ag_icdK","add.ag_icdK", "main.bp_icdK","add.bp_icdK")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdK,"icdK2_result_farmers_20.01.csv")
+
+#icdL
+result_icdL<-data.frame(db_icdL,tq_icdL,ht_icdL,vl_icdL,ag_icdL, bp_icdL)
+colnames(result_icdL)<-c("main.db_icdL","add.db_icdL","main.tq_icdL","add.tq_icdL", "main.ht_icdL","add.ht_icdL","main.vl_icdL","add.vl_icdL", "main.ag_icdL","add.ag_icdL", "main.bp_icdL","add.bp_icdL")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdL,"icdL2_result_farmers_20.01.csv")
+
+#icdN
+result_icdN<-data.frame(db_icdN,tq_icdN,ht_icdN,vl_icdN,ag_icdN, bp_icdN)
+colnames(result_icdN)<-c("main.db_icdN","add.db_icdN","main.tq_icdN","add.tq_icdN", "main.ht_icdN","add.ht_icdN","main.vl_icdN","add.vl_icdN", "main.ag_icdN","add.ag_icdN", "main.bp_icdN","add.bp_icdN")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_icdN,"icdN2_result_farmers_20.01.csv")
+
+
+#d0060
+result_d0060<-data.frame(db_d0060,tq_d0060,ht_d0060,vl_d0060,ag_d0060, bp_d0060)
+colnames(result_d0060)<-c("main.db_d0060","add.db_d0060","main.tq_d0060","add.tq_d0060", "main.ht_d0060","add.ht_d0060","main.vl_d0060","add.vl_d0060", "main.ag_d0060","add.ag_d0060", "main.bp_d0060","add.bp_d0060")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_d0060,"d00602_result_farmers_20.01.csv")
+
+#d61
+result_d61<-data.frame(db_d61,tq_d61,ht_d61,vl_d61,ag_d61, bp_d61)
+colnames(result_d61)<-c("main.db_d61","add.db_d61","main.tq_d61","add.tq_d61", "main.ht_d61","add.ht_d61","main.vl_d61","add.vl_d61", "main.ag_d61","add.ag_d61", "main.bp_d61","add.bp_d61")
+
+setwd( "/Users/guest2/Desktop")
+write.csv(result_d61,"d612_result_farmers_20.01.csv")
+
+
+#library(readxl)
+#result_hos2pitalization2_long_format <- read_excel("~/Desktop/phân tích/tổng /F10-19+F20-29/result_hos2pitalization2_long_format.xlsx", 
+#                                                 sheet = "hw.2.97")
+#dat2<-result_hos2pitalization2_long_format 
+
+require(ggplot2)
+dat5<- result_hos2pitalization_hh_25_9
+
+dat5$cause.specific <- as.character(dat5$cause.specific)
+dat5$cause.specific <- factor(dat5$cause.specific, levels=unique(dat5$cause.specific))
+
+p<-ggplot(data=dat5,aes(x = cause.specific,y = RR,col=effect.type))+geom_pointrange(aes(ymin = RR.low,ymax = RR.high),position = position_dodge(0.5))+ggtitle("Pooled effect of heatwaves")+geom_hline(yintercept=1, linetype="dashed", color = "red")
+
+print(p)
+
+p+ labs(title="Pooled effect of heatwaves",
+        x ="Cause specific", y = "RR")+theme(
+          plot.title = element_text(size=14, face="bold"),
+          axis.title.x = element_text(size=14, face="bold"),
+          axis.title.y = element_text(size=14, face="bold")
+        )+ labs(fill = "Effect type")+ scale_color_brewer(palette="Dark2")+ 
+  theme(axis.text.x = element_text(face="plain", color="#993333", 
+                                   size=10),
+        axis.text.y = element_text(face="bold", color="#993333", 
+                                   size=14, angle=45))+ theme(plot.title = element_text(hjust = 0.5))
+
+
+```
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+  
+  ```{r cars}
+summary(cars)
+```
+
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
