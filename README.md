@@ -5,3 +5,5 @@
 # all6ctities_temp2: temperature and hospitalizations in the second stage
 # all2_hw1: heatwaves and hospitalizations in the first stage
 # all2_hw2: heatwaves and hospitalizations in the second stage
+#
+# Reference: "Reducing and meta-analyzing estimates from distributed lag non-linear models" - Gasparrini and Armstrong
