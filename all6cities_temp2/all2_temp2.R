@@ -1,16 +1,3 @@
-###############################################################################
-# Updated version of the code for the analysis in:
-#
-#   "Reducing and meta-analyzing estimates from distributed lag non-linear models"
-#   Gasparrini and Armstrong 
-#   BMC Medical Research Methodology - 2013
-#   http://www.ag-myresearch.com/2013_gasparrini_bmcmrm.html
-#
-# Update: 05 December 2017
-# * an updated version of this code, compatible with future versions of the
-#   software, is available at:
-#   http://www.ag-myresearch.com/2013_gasparrini_bmcmrm.html
-###############################################################################
 
 ####################################################################
 # FIRST STAGE
